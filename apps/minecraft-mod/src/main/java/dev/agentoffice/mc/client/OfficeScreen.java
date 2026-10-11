@@ -3,6 +3,7 @@ package dev.agentoffice.mc.client;
 import dev.agentoffice.mc.client.ui.FlatButton;
 import dev.agentoffice.mc.client.ui.TabletScreen;
 import dev.agentoffice.mc.client.ui.Theme;
+import dev.agentoffice.mc.core.AgentNames;
 import dev.agentoffice.mc.core.AgentOfficeClient;
 import dev.agentoffice.mc.core.Api;
 import java.io.IOException;
@@ -92,7 +93,7 @@ public final class OfficeScreen extends TabletScreen {
                             onClose();
                         }));
                 if (label.equals("Use")) {
-                    placeButton.setTooltip(Tooltip.create(Component.literal("Move " + slot.agentId()
+                    placeButton.setTooltip(Tooltip.create(Component.literal("Move " + AgentNames.of(slot.agentId())
                             + "'s body here, talking to this seat instead of " + (standing.label() != null && !standing.label().isBlank() ? standing.label() : standing.instanceId()))));
                 }
             }
@@ -268,7 +269,7 @@ public final class OfficeScreen extends TabletScreen {
             int dot = "running".equals(st) ? Theme.OK : "needs_attention".equals(st) ? Theme.AMBER : st == null ? Theme.BG_4 : Theme.TXT_4;
             g.fill(mx0 + 6, y + 8, mx0 + 10, y + 12, dot);
             int textW = mx1 - mx0 - buttonsW - 16;
-            String name = slot.displayName() + (slot.label() != null && !slot.label().isBlank() ? "  (" + slot.agentId() + ")" : "");
+            String name = slot.displayName() + (slot.label() != null && !slot.label().isBlank() ? "  (" + AgentNames.of(slot.agentId()) + ")" : "");
             g.drawString(font, bold(name, textW), mx0 + 15, y + 6, Theme.TXT, false);
             Api.Agent def = agents.get(slot.agentId());
             String model = orDefault(seat.model(), def == null ? null : def.defaultModel());

@@ -19,6 +19,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.Executor;
 import java.util.function.Consumer;
 
@@ -161,6 +162,7 @@ public final class AgentOfficeClient {
             for (JsonElement el : call(get("/api/agents")).getAsJsonArray()) {
                 JsonObject a = el.getAsJsonObject();
                 out.add(new Api.Agent(str(a, "name"), str(a, "description"), str(a, "defaultModel"), str(a, "defaultEffort")));
+                AgentNames.remember(str(a, "name"), str(a, "displayName"));
             }
             return out;
         });
@@ -220,6 +222,38 @@ public final class AgentOfficeClient {
     public Optional<Api.Conversation> current(Api.Slot slot) throws IOException {
         JsonElement el = call(get("/api/conversations?agentId=" + enc(slot.agentId()) + "&instanceId=" + enc(slot.instanceId())));
         return parse(() -> el.isJsonNull() ? Optional.empty() : Optional.of(conversation(el)));
+    }
+
+    /** Uploads a file to the project (as the web composer does); returns where it was saved, for the message. */
+    public String upload(String projectId, String filename, String contentType, byte[] data) throws IOException {
+        writable();
+        String boundary = "agentoffice-" + UUID.randomUUID();
+        HttpRequest req = HttpRequest.newBuilder(base.resolve("/api/projects/" + enc(projectId) + "/uploads"))
+                .timeout(SEAT_TIMEOUT)
+                .header("content-type", "multipart/form-data; boundary=" + boundary)
+                .POST(HttpRequest.BodyPublishers.ofByteArray(Attachments.multipart(boundary, filename, contentType, data)))
+                .build();
+        JsonElement el = call(req);
+        return parse(() -> str(el.getAsJsonObject(), "path"));
+    }
+
+    /**
+     * The clipboard image as Agent Office's host reads it (Linux/Wayland only: wl-paste). Empty when there is none;
+     * anything else (wl-paste missing, too large) is an error that says so.
+     */
+    public Optional<byte[]> clipboardImage() throws IOException {
+        HttpRequest req = HttpRequest.newBuilder(base.resolve("/api/clipboard-image")).timeout(TIMEOUT)
+                .POST(HttpRequest.BodyPublishers.noBody()).build();
+        HttpResponse<byte[]> res;
+        try {
+            res = http.send(req, HttpResponse.BodyHandlers.ofByteArray());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted", e);
+        }
+        if (res.statusCode() == 404) return Optional.empty();
+        if (res.statusCode() != 200) throw apiError(res.statusCode(), new String(res.body(), StandardCharsets.UTF_8));
+        return res.body().length > 0 ? Optional.of(res.body()) : Optional.empty();
     }
 
     /** Starts a turn, or queues it if the agent is busy (server decides). */

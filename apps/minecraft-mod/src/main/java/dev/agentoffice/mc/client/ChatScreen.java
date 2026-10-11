@@ -10,14 +10,18 @@ import dev.agentoffice.mc.client.ui.ImageScreen;
 import dev.agentoffice.mc.client.ui.TabletScreen;
 import dev.agentoffice.mc.client.ui.Theme;
 import dev.agentoffice.mc.client.ui.TranscriptView;
+import dev.agentoffice.mc.core.AgentNames;
 import dev.agentoffice.mc.core.AgentOfficeClient;
 import dev.agentoffice.mc.core.Api;
+import dev.agentoffice.mc.core.Attachments;
 import dev.agentoffice.mc.core.Transcript;
 import java.io.Closeable;
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -73,6 +77,9 @@ public final class ChatScreen extends WorkspaceScreen {
     /** Replaced when Agent Office restarts on another port (see {@link #rediscover}). */
     private AgentOfficeClient client;
     private MultiLineEditBox input;
+    private final List<Attached> attachments = new ArrayList<>();
+    /** Main thread only: one paste at a time. */
+    private boolean pasting;
     private int shownLines = 1;
     private Api.Conversation conversation;
     private List<Transcript.Item> history = List.of();
@@ -208,6 +215,35 @@ public final class ChatScreen extends WorkspaceScreen {
         if (running) {
             addRenderableWidget(new FlatButton(x1 - sendW - 4 - stopW, by, stopW, 20, "Stop", FlatButton.Kind.DANGER, b -> stop()))
                     .active = !busy;
+        }
+
+        // Pasted images wait above the composer until sent; a click takes one off.
+        if (!attachments.isEmpty()) {
+            cy -= 20;
+            int ax = x0;
+            List<Attached> all = List.copyOf(attachments);
+            for (int i = 0; i < all.size(); i++) {
+                Attached a = all.get(i);
+                String chip = (a.path() == null ? "… " : "✕ ") + font.plainSubstrByWidth(a.name(), 110);
+                int w = buttonWidth(chip);
+                // No room for this one and a "+N" after it: the rest go in one chip that drops them all.
+                if (ax + w + buttonWidth("✕ +" + (all.size() - i)) + 4 > x1) {
+                    List<Attached> hidden = all.subList(i, all.size());
+                    addRenderableWidget(new FlatButton(ax, cy, buttonWidth("✕ +" + hidden.size()), 16, "✕ +" + hidden.size(),
+                            FlatButton.Kind.NORMAL, x -> {
+                                attachments.removeAll(hidden);
+                                rebuildWidgets();
+                            })).setTooltip(Tooltip.create(Component.literal("Don't send these " + hidden.size() + " images")));
+                    break;
+                }
+                FlatButton b = addRenderableWidget(new FlatButton(ax, cy, w, 16, chip, FlatButton.Kind.NORMAL, x -> {
+                    attachments.remove(a);
+                    rebuildWidgets();
+                }));
+                b.active = a.path() != null;
+                b.setTooltip(Tooltip.create(Component.literal(a.path() == null ? "Uploading…" : "Don't send " + a.name())));
+                ax += w + 4;
+            }
         }
 
         // At the bottom of the transcript's well: needs-attention actions, then pending approvals.
@@ -382,9 +418,18 @@ public final class ChatScreen extends WorkspaceScreen {
     }
 
     private void send() {
-        String text = input.getValue().trim();
-        if (text.isEmpty() || conversation == null) return;
+        if (conversation == null) return;
+        if (pasting || attachments.stream().anyMatch(a -> a.path() == null)) {
+            flash("Still uploading the image…");
+            return;
+        }
+        String typed = input.getValue();
+        List<Attached> sending = List.copyOf(attachments);
+        String text = Attachments.compose(typed, sending.stream().map(Attached::path).toList());
+        if (text == null) return;
         input.setValue("");
+        attachments.clear();
+        rebuildWidgets();
         view.scrollToBottom();
         String id = conversation.id();
         AgentOfficeClient c = client;
@@ -395,7 +440,64 @@ public final class ChatScreen extends WorkspaceScreen {
             } catch (IOException e) {
                 onMain(() -> {
                     flash("Not sent: " + e.getMessage());
-                    if (input.getValue().isEmpty()) input.setValue(text);
+                    if (input.getValue().isEmpty()) input.setValue(typed.trim());
+                    attachments.addAll(0, sending);
+                    rebuildWidgets();
+                });
+            }
+        });
+    }
+
+    /** Ctrl+V (Cmd+V on a Mac), from the key event's own modifiers rather than what the keyboard holds right now. */
+    private static boolean isPaste(int keyCode, int modifiers) {
+        int command = Minecraft.ON_OSX ? GLFW.GLFW_MOD_SUPER : GLFW.GLFW_MOD_CONTROL;
+        return keyCode == GLFW.GLFW_KEY_V && (modifiers & command) != 0 && (modifiers & (GLFW.GLFW_MOD_SHIFT | GLFW.GLFW_MOD_ALT)) == 0;
+    }
+
+    /** An image pasted into the composer: its name, and where Agent Office saved it (null while uploading). */
+    private record Attached(String name, String path) {}
+
+    /**
+     * Ctrl+V with no text on the clipboard: its image (if any) is uploaded to the project and attached to the
+     * next message, as in the web app.
+     */
+    private void pasteImage() {
+        if (pasting) return;
+        pasting = true;
+        flash("Reading the clipboard…");
+        String projectId = slot.projectId();
+        AgentOfficeClient c = client;
+        Connection.IO.execute(() -> {
+            Attached[] uploading = new Attached[1];
+            try {
+                Optional<ClipboardImages.Clip> clip = ClipboardImages.read(c);
+                if (clip.isEmpty()) {
+                    onMain(() -> {
+                        pasting = false;
+                        flash("Nothing to paste: no text or image on the clipboard.");
+                    });
+                    return;
+                }
+                uploading[0] = new Attached(clip.get().filename(), null);
+                onMain(() -> {
+                    attachments.add(uploading[0]);
+                    rebuildWidgets();
+                });
+                String path = c.upload(projectId, clip.get().filename(), clip.get().contentType(), clip.get().data());
+                onMain(() -> {
+                    pasting = false;
+                    int i = attachments.indexOf(uploading[0]);
+                    // The name the server saved it under (it may tidy it), as the web composer shows.
+                    if (i >= 0) attachments.set(i, new Attached(Path.of(path).getFileName().toString(), path));
+                    flash("Attached " + uploading[0].name() + ".");
+                    rebuildWidgets();
+                });
+            } catch (IOException | RuntimeException e) {
+                onMain(() -> {
+                    pasting = false;
+                    if (uploading[0] != null) attachments.remove(uploading[0]);
+                    flash("Couldn't paste the image: " + e.getMessage());
+                    rebuildWidgets();
                 });
             }
         });
@@ -656,6 +758,11 @@ public final class ChatScreen extends WorkspaceScreen {
             send();
             return true;
         }
+        // Text on the clipboard pastes as text (the box does it); nothing but an image goes up as an attachment.
+        if (isPaste(keyCode, modifiers) && input != null && input.isFocused() && minecraft.keyboardHandler.getClipboard().isEmpty()) {
+            pasteImage();
+            return true;
+        }
         return super.keyPressed(keyCode, scanCode, modifiers);
     }
 
@@ -723,7 +830,7 @@ public final class ChatScreen extends WorkspaceScreen {
         int tx = left + 10;
         int end = headerRight - 8;
         int ty = top + 6;
-        FormattedCharSequence name = bold(slot.agentId(), end - tx);
+        FormattedCharSequence name = bold(AgentNames.of(slot.agentId()), end - tx);
         g.drawString(font, name, tx, ty, PANEL_TEXT, false);
         tx += font.width(name) + 6;
         String which = sessionName(slot);
@@ -803,6 +910,8 @@ public final class ChatScreen extends WorkspaceScreen {
         busy = false; // its result may have been dropped while closed
         answering.clear();
         refreshPending = false; // its delayed refresh was dropped while closed
+        pasting = false; // so was a paste's ending: its chip would wait forever
+        attachments.removeIf(a -> a.path() == null);
     }
 
     private void closeStream() {
