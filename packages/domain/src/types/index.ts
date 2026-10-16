@@ -106,6 +106,8 @@ export interface PersistedRun {
   currentTool?: string;
   cacheCreationTokens?: number;
   cacheReadTokens?: number;
+  errorCode?: RunErrorCode;
+  errorDetail?: string;
   /** Set from the run's own tool_calls when it started a `run_in_background`
    *  Bash shell — see ProcessInfo.runId for whether it's still alive. */
   backgroundTaskCommand?: string;
