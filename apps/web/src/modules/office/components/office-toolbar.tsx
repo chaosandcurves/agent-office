@@ -28,6 +28,7 @@ import {
   openProjectFolder,
 } from "@/lib/api/dev-server";
 import { listProcesses, getProcess, killProcess } from "@/lib/api/processes";
+import { killErrorKey } from "@/modules/processes/format/process-format";
 
 // Shared compact button style for all toolbar action buttons
 const TBTN = "inline-flex items-center gap-[5px] px-[9px] h-[30px] rounded-[7px] text-[12px] text-txt-2 border border-transparent hover:bg-bg-3 hover:text-txt transition-[background,color,border-color] duration-[120ms] cursor-pointer select-none shrink-0";
@@ -64,6 +65,7 @@ export function DevServerButton({ projectId, menu = false }: { projectId: string
 
   const qc = useQueryClient();
   const store = useDevServerStore();
+  const tProcesses = useTranslations("processes_modal");
 
   const devQ = useQuery({
     queryKey: ["project-dev-config", projectId],
@@ -254,7 +256,19 @@ export function DevServerButton({ projectId, menu = false }: { projectId: string
     const s = getState(key);
     if (s.phase !== "running") return;
     setKeyState(key, { phase: "stopping" });
-    try { await killProcess(s.pid); } catch { /* best-effort */ }
+    try {
+      await killProcess(s.pid);
+    } catch (e) {
+      const errorKey = killErrorKey(e);
+      // Maybe still our server: showing it idle invites a second one onto the busy port.
+      // A 403 means the pid isn't ours to kill (reused, or another user's), so that one goes idle.
+      if (errorKey === "kill_error_ownership_unverified" || errorKey === "kill_error_failed") {
+        setKeyState(key, s);
+        toast(tProcesses(errorKey, { pid: s.pid }));
+        return;
+      }
+      if (errorKey === "kill_error_forbidden") toast(tProcesses(errorKey, { pid: s.pid }));
+    }
     setKeyState(key, { phase: "idle" });
   }
 
