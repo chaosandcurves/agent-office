@@ -35,9 +35,10 @@ import {
   type TaskStarted,
 } from "./runs/subagent-parse";
 import { liveRuns, runFinishedListeners } from "./runs/registry";
+import { isBackgroundBashInput, isBackgroundedBashResult, noteEarlierChildren, trackBackgroundShell } from "./runs/background-shell";
 import { prepareProviderSpawn, releaseProviderSpawn, runCost, settleRunCost, type ProviderRefusal } from "./runs/provider-spawn";
 import { spawnClaude } from "../infra/claude-bin";
-import { isBackgroundBashInput, isBackgroundedBashResult, snapshotChildPids, trackBackgroundShell } from "./runs/background-shell";
+import { agentIdForCliName } from "../agents/agents";
 import { notePrCreate, settlePrCreate } from "./runs/pr-create";
 import { isOwnText, noteToolCall, startTextBlock } from "./runs/text-blocks";
 import { classifyProviderResult, failFastOnEvent, initModel, type ProviderFailure } from "./runs/provider-stream";
@@ -487,6 +488,7 @@ function broadcast(run: LiveRun, raw: SseEvent): void {
     event.name === "tool-done" ||
     event.name === "usage" ||
     event.name === "subagent" ||
+    event.name === "subagent-update" ||
     event.name === "rate-limit"
   ) {
     run.eventLog.push(event as ReplayableEvent);
@@ -630,8 +632,9 @@ function handleStreamLine(run: LiveRun, line: string): void {
           run.pendingBackgroundBash.set(block.id, {
             command: block.input.command,
             description: typeof block.input.description === "string" ? block.input.description : undefined,
-            childPidsBefore: new Set(snapshotChildPids(run.proc.pid)),
+            requestedAt: ts,
           });
+          noteEarlierChildren(run);
         }
       }
     }
@@ -680,7 +683,7 @@ function handleStreamLine(run: LiveRun, line: string): void {
         const pending = run.pendingBackgroundBash.get(block.tool_use_id);
         if (pending) {
           run.pendingBackgroundBash.delete(block.tool_use_id);
-          if (!block.is_error) trackBackgroundShell(run, pending);
+          if (!block.is_error) void trackBackgroundShell(run, pending);
         }
       }
     }
@@ -816,6 +819,7 @@ function bridgeChildToParent(parentRun: LiveRun, subRunId: string): void {
           tokensOut: childRun.tokensOut,
           cost: childRun.cost,
           lastOutputLine: lastLine,
+          durationMs: isDone ? now - childRun.startTs : undefined,
         },
       });
 
@@ -834,7 +838,13 @@ function spawnSubAgentRecord(
   spawn: { agentId: string; prompt: string },
 ): void {
   const subRunId = randomUUID();
-  const { agentId: childAgentId, prompt } = spawn;
+  const { prompt } = spawn;
+  let childAgentId = spawn.agentId;
+  try {
+    childAgentId = agentIdForCliName(spawn.agentId);
+  } catch (err) {
+    log.warn("subagent.id_lookup_failed", { name: spawn.agentId, err: String(err) });
+  }
   const startTs = Date.now();
 
   parentRun.childRunIds.push(subRunId);
@@ -847,7 +857,7 @@ function spawnSubAgentRecord(
     db.insertRun({
       id: subRunId,
       agentId: childAgentId,
-      agentName: childAgentId,
+      agentName: spawn.agentId,
       instanceId: parentRun.instanceId,
       instanceLabel: parentRun.instanceLabel,
       projectId: parentRun.projectId,
@@ -873,6 +883,7 @@ function spawnSubAgentRecord(
       agentId: childAgentId,
       prompt,
       status: "running",
+      startTs,
     },
   });
 
@@ -904,6 +915,7 @@ function finalizeSubAgent(
     db.updateRun(record.subRunId, {
       status: status === "done" ? "done" : "error",
       exitCode: status === "done" ? 0 : 1,
+      errorCode: status === "cancelled" ? "stopped" : status === "timeout" ? "max_runtime" : undefined,
       output,
       tokensIn: 0,
       tokensOut: 0,
@@ -925,6 +937,7 @@ function finalizeSubAgent(
       tokensOut: 0,
       cost: 0,
       lastOutputLine: lastLine,
+      durationMs: durMs,
     },
   });
 }

@@ -1,8 +1,8 @@
-// GET/PUT/DELETE /api/agents/<id> — read, overwrite, or delete one agent.
-// PUT snapshots the current body to a timestamped history file (max 10) first.
-import { agents } from "@agent-office/domain/services";
-import { validateBody } from "../../../lib/validation";
-import { agentBodySchema } from "@agent-office/api-contract";
+// GET/PUT/DELETE /api/agents/<id> — read, update, or delete one agent and its sessions (?work=). PUT edits an
+// existing <id>.md only (404 otherwise), changes only the keys sent, and snapshots a changed body.
+import { agents, projects } from "@agent-office/domain/services";
+import { validateBody, validateQuery } from "../../../lib/validation";
+import { agentUpdateSchema, sessionRemovalQuerySchema } from "@agent-office/api-contract";
 import { notFound, tryService, validateIdParam } from "../../../lib/api-helpers";
 
 type Params = { params: Promise<{ id: string }> };
@@ -19,21 +19,26 @@ export async function PUT(request: Request, { params }: Params) {
   const { value: id, error: paramError } = validateIdParam((await params).id);
   if (paramError) return paramError;
   const raw: unknown = await request.json();
-  const { data: body, error } = validateBody(agentBodySchema, raw);
+  const { data: patch, error } = validateBody(agentUpdateSchema, raw);
   if (error) return error;
 
-  // Back up current body text before overwriting
-  const current = agents.readAgent(id);
-  if (current?.body) {
-    agents.backupAgentBody(id, current.body);
-  }
-
-  return tryService(() => ({ id: agents.writeAgent({ ...body, id }) }));
+  return tryService(() => {
+    const result = agents.updateAgent(id, patch);
+    if (!result.ok) return Response.json({ error: result.error }, { status: result.status });
+    return { id: result.value };
+  });
 }
 
-export async function DELETE(_request: Request, { params }: Params) {
+export async function DELETE(request: Request, { params }: Params) {
   const { value: id, error } = validateIdParam((await params).id);
   if (error) return error;
-  const ok = agents.deleteAgent(id);
-  return ok ? Response.json({ deleted: id }) : notFound();
+  const query = validateQuery(sessionRemovalQuerySchema, new URL(request.url).searchParams);
+  if (query.error) return query.error;
+  if (!agents.readAgent(id)) return notFound();
+  return tryService(() => {
+    const files = agents.backupAgentFiles(id);
+    projects.removeAgentSessions(id, query.data.work);
+    agents.removeAgentFiles(files);
+    return { deleted: id };
+  });
 }

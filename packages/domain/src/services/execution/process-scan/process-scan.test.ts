@@ -1,12 +1,69 @@
 import assert from "node:assert";
-import { realpathSync } from "node:fs";
+import crossSpawn from "cross-spawn";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createServer, type AddressInfo } from "node:net";
 import { test } from "node:test";
 import { parseEtime, parseLsofCwds, parseLsofListeners, parsePs } from "./darwin";
 import { scanner } from "./index";
 import { parseSs } from "./linux";
-import { splitHostPort } from "./probe";
-import { parseDetails, parseNetstat } from "./windows";
+import { parsePsChildren, splitHostPort } from "./probe";
+import { parseChildren, parseDetails, parseNetstat } from "./windows";
+
+// Background-shell tracking used `ps --ppid`, which only procps has: it found nothing on Windows and macOS.
+test("live: children lists a child this process just spawned, with its start time", { skip: !scanner }, async () => {
+  const before = Date.now();
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" });
+  try {
+    await new Promise((resolve) => child.once("spawn", resolve));
+    const kids = await scanner!.children(process.pid);
+    assert.ok(kids, "the probe must run on this platform");
+    const mine = kids.find((k) => k.pid === child.pid);
+    assert.ok(mine, `child ${child.pid} not in ${JSON.stringify(kids)}`);
+    assert.ok(mine.startedAt >= before - 2000 && mine.startedAt <= Date.now() + 1000, String(mine.startedAt));
+  } finally {
+    child.kill();
+  }
+});
+
+// An npm `claude` runs through cross-spawn's cmd.exe shim: the run's pid is cmd.exe, and its shells are the CLI's children.
+test("live windows: children of a cmd.exe shim are the children of the program it launched", { skip: process.platform !== "win32" }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ao-shim-"));
+  const pidFile = join(dir, "shell.pid");
+  writeFileSync(join(dir, "cli.js"), [
+    "const c = require('child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' });",
+    `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(c.pid));`,
+    "setTimeout(() => {}, 30000);",
+  ].join("\n"));
+  writeFileSync(join(dir, "fake-cli.cmd"), `@"${process.execPath}" "%~dp0cli.js" %*\r\n`);
+  const shim = crossSpawn(join(dir, "fake-cli.cmd"), [], { stdio: "ignore" });
+  try {
+    for (let i = 0; i < 50 && !existsSync(pidFile); i++) await new Promise((resolve) => setTimeout(resolve, 100));
+    const kids = await scanner!.children(shim.pid!);
+    assert.ok(kids, "the probe must run");
+    assert.deepStrictEqual(kids.map((k) => k.pid), [Number(readFileSync(pidFile, "utf8"))]);
+  } finally {
+    spawnSync("taskkill", ["/pid", String(shim.pid), "/t", "/f"], { stdio: "ignore" });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("posix: ps children rows keep only the parent's, timed by etime", () => {
+  const ps = "  10     1      01:00\n  11    10      00:05\n  12    10   1-00:00:00\n  13    11      00:01\n";
+  assert.deepStrictEqual(parsePsChildren(ps, 10, 100_000_000), [
+    { pid: 11, startedAt: 100_000_000 - 5000 },
+    { pid: 12, startedAt: 100_000_000 - 86_400_000 },
+  ]);
+});
+
+test("windows: children JSON; no output is a failure, not \"no children\"", () => {
+  assert.deepStrictEqual(parseChildren('{"procs":[{"pid":42,"startedAt":1700000000000}]}'), [{ pid: 42, startedAt: 1700000000000 }]);
+  assert.deepStrictEqual(parseChildren('{"procs":[]}'), []);
+  assert.strictEqual(parseChildren(""), null);
+  assert.strictEqual(parseChildren("Get-CimInstance : Access denied"), null);
+});
 
 // The parsers below run on fixtures; this runs the real probe of whatever OS the suite is on (CI: Linux).
 test("live: the scanner finds this process's own listening socket and its cwd", { skip: !scanner }, async () => {

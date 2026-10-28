@@ -6,6 +6,8 @@ import { queryKeys } from "@/lib/api/query-keys";
 import { API_ROUTES } from "@agent-office/api-contract";
 import { POLL } from "@/lib/polling";
 import type { AgentBody, ApiAgent, ContextCostBreakdown } from "@agent-office/domain/types";
+import type { WorkChoice } from "@agent-office/domain/config/sessions";
+import { workQuery } from "@/lib/api/roster";
 
 /** "Context & Cost" tab data for one agent+instance — see
  *  `@agent-office/domain` services/agents/context-cost.ts. Its numbers depend
@@ -85,7 +87,7 @@ export function useAgentMemory(id: string | null) {
 export function useWriteAgent() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (body: AgentBody) =>
+    mutationFn: (body: Pick<AgentBody, "id"> & Partial<AgentBody>) =>
       apiFetch<{ id: string }>(API_ROUTES.agent(body.id), {
         method: "PUT",
         body,
@@ -115,10 +117,14 @@ export function useCreateAgent() {
 export function useDeleteAgent() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (id: string) =>
-      apiFetch<{ deleted: string }>(API_ROUTES.agent(id), { method: "DELETE" }),
+    mutationFn: ({ id, work }: { id: string; work?: WorkChoice }) =>
+      apiFetch<{ deleted: string }>(`${API_ROUTES.agent(id)}${workQuery(work)}`, { method: "DELETE" }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: queryKeys.agents.all });
+    },
+    // Even a refused delete may have removed sessions in some projects before failing.
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: queryKeys.projects.all });
     },
   });
 }

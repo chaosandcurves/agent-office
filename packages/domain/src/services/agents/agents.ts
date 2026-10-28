@@ -11,12 +11,13 @@
 // right after skills because it's static and never edited by the user, while
 // memory (all three flavors) is treated as accumulated state.
 
-import { readdirSync, readFileSync, existsSync, rmSync, statSync, unlinkSync } from "node:fs";
+import { copyFileSync, readdirSync, readFileSync, existsSync, rmSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import type { ApiAgent, AgentBody, AgentBodyHistoryEntry, PanelSeat, Project, PromptSegment, PromptSegmentChild } from "../../types/index";
-import { AGENTS_DIR, GLOBAL_MEMORY_PATH, PROJECTS_DIR, isValidIdSegment } from "../infra/paths";
+import { AGENTS_DIR, AGENT_BACKUPS_DIR, GLOBAL_MEMORY_PATH, PROJECTS_DIR, isValidIdSegment } from "../infra/paths";
 import { ensureDir, writeFileAtomic } from "../infra/fs-atomic";
-import { parseFrontmatter, stringifyYaml, isYamlMapping, type YamlValue } from "../infra/yaml";
+import { isYamlMapping, type YamlValue } from "../infra/yaml";
+import { hasAgentFrontmatter, mergeFrontmatter, opensFrontmatter, parseAgentFrontmatter, splitAgentFile } from "./frontmatter";
 import { buildSkillsBundle } from "../skills/skills";
 import { RESPONSE_STYLE } from "../../config/response-style";
 import { unknownTools, retiredToolHints } from "../../config/tools";
@@ -35,9 +36,6 @@ function lineCount(text: string): number {
   return text ? text.split("\n").length : 0;
 }
 
-function hasFrontmatter(content: string): boolean {
-  return /^---\r?\n[\s\S]*?\r?\n---(\r?\n|$)/.test(content);
-}
 
 /** Frontmatter is hand-edited and bypasses the API's zod schemas, so an
  *  unknown value would reach `--permission-mode` verbatim. Drop it instead:
@@ -92,8 +90,11 @@ export function readAgent(name: string): { info: ApiAgent; body: string } | null
   const path = join(AGENTS_DIR, `${name}.md`);
   if (!existsSync(path)) return null;
   const content = readFileSync(path, "utf8");
-  const { fm, body } = parseFrontmatter(content);
+  const split = splitAgentFile(content);
+  const fm = split ? parseAgentFrontmatter(split.yaml) : {};
+  const body = split ? split.body : content;
   const info: ApiAgent = {
+    id: name,
     name: asString(fm.name) ?? name,
     displayName: asString(fm["display-name"] ?? fm["displayName"]),
     description: asString(fm.description) ?? "",
@@ -121,48 +122,93 @@ export function listAgents(): ApiAgent[] {
         !f.endsWith(".identity.md") &&
         !f.startsWith("_") &&
         !f.includes(".body.") &&
-        hasFrontmatter(readFileSync(join(AGENTS_DIR, f), "utf8")),
+        hasAgentFrontmatter(readFileSync(join(AGENTS_DIR, f), "utf8")),
     )
     .map((f) => readAgent(f.replace(/\.md$/, ""))?.info)
     .filter((a): a is ApiAgent => a !== undefined);
 }
 
-export function writeAgent(b: AgentBody): string {
+/** A sub-agent's `subagent_type` is the CLI's name for it; unclaimed names (project agents) stay as they are. */
+export function agentIdForCliName(name: string): string {
+  return listAgents().find((a) => a.name === name)?.id ?? name;
+}
+
+export type WriteAgentResult = { ok: true; value: string } | { ok: false; error: string; status: number };
+
+/** The fields a client sends; an absent one keeps the file's value. */
+export type AgentPatch = Partial<Omit<AgentBody, "id">>;
+
+export function writeAgent(id: string, b: AgentPatch): WriteAgentResult {
+  if (!isValidIdSegment(id)) return { ok: false, error: "invalid_id", status: 400 };
   ensureDir(AGENTS_DIR);
-  if (!isValidIdSegment(b.id)) throw new Error("invalid id");
-  const id = b.id;
   const file = join(AGENTS_DIR, `${id}.md`);
-  const fm: Record<string, YamlValue> = {
-    name: id,
-    description: b.desc.replace(/\n/g, " "),
-    "default-model": b.model,
-    "default-effort": b.effort,
-    skills: b.skills,
-    tools: b.tools,
-    "permission-mode": b.pm,
-  };
-  // Human display name. Only persisted when it adds information over the slug,
+  const current = existsSync(file) ? readFileSync(file, "utf8") : "";
+  const split = splitAgentFile(current);
+  // An opening fence with no block we can find: writing would replace keys we never read.
+  if (!split && opensFrontmatter(current)) return { ok: false, error: "frontmatter_unparseable", status: 422 };
+  // Renaming the agent the CLI sees is not an edit the form can make.
+  const name = (split && asString(parseAgentFrontmatter(split.yaml).name)) || id;
+  const owned: Record<string, YamlValue | undefined> = { name };
+  // Human display name. Only persisted when it adds information over the name,
   // so trivial "name == id" agents keep a clean frontmatter and fall back to
   // slug-prettifying in the UI.
   const label = b.name?.trim();
-  if (label && label !== id) fm["display-name"] = label;
-  if (b.room) fm.room = b.room;
-  if (b.unit && b.unit.trim()) fm.unit = b.unit.trim();
-  if (b.panel?.length) fm.panel = b.panel as unknown as YamlValue;
-  const content = `---\n${stringifyYaml(fm).trim()}\n---\n\n${b.body}\n`;
-  writeFileAtomic(file, content);
-  return id;
+  if (b.name !== undefined) owned["display-name"] = label && label !== name ? label : undefined;
+  if (b.desc !== undefined) owned.description = b.desc.replace(/\n/g, " ");
+  if (b.model !== undefined) owned["default-model"] = b.model;
+  if (b.effort !== undefined) owned["default-effort"] = b.effort;
+  if (b.skills) owned.skills = b.skills;
+  if (b.tools) owned.tools = b.tools;
+  if (b.pm !== undefined) owned["permission-mode"] = b.pm;
+  // Present but empty clears; the editor sends "" for a cleared field.
+  if ("room" in b) owned.room = b.room || undefined;
+  if ("unit" in b) owned.unit = b.unit?.trim() || undefined;
+  if (b.panel) owned.panel = b.panel.length ? (b.panel as unknown as YamlValue) : undefined;
+  if (b.addDirs) owned["add-dirs"] = b.addDirs.length ? b.addDirs : undefined;
+  const body = b.body ?? split?.body.trim() ?? "";
+  writeFileAtomic(file, `---\n${mergeFrontmatter(split?.yaml ?? "", owned)}\n---\n\n${body}\n`);
+  return { ok: true, value: id };
 }
 
-export function deleteAgent(id: string): boolean {
+/** Create only: an id that is taken is a 409, never an overwrite of someone's agent. */
+export function createAgent(b: AgentBody): WriteAgentResult {
+  if (!isValidIdSegment(b.id)) return { ok: false, error: "invalid_id", status: 400 };
+  if (existsSync(join(AGENTS_DIR, `${b.id}.md`))) return { ok: false, error: "agent_exists", status: 409 };
+  const { id, ...fields } = b;
+  return writeAgent(id, fields);
+}
+
+export function updateAgent(id: string, patch: AgentPatch): WriteAgentResult {
+  if (!isValidIdSegment(id)) return { ok: false, error: "invalid_id", status: 400 };
+  const before = readAgent(id);
+  if (!before) return { ok: false, error: "not_found", status: 404 };
+  // Only a real change: a model switch snapshotted identical bodies and evicted real ones.
+  const changed = patch.body !== undefined && before.body !== "" && before.body !== patch.body.trim();
+  const snapshot = changed ? snapshotAgentBody(id, before.body) : null;
+  const result = writeAgent(id, patch);
+  if (result.ok) pruneAgentBodyHistory(id);
+  else if (snapshot) rmSync(snapshot, { force: true });
+  return result;
+}
+
+/** Copies the agent's files to AGENT_BACKUPS_DIR and returns them, for `removeAgentFiles`.
+ *  Separate so a failed copy throws before the agent's sessions are touched. */
+export function backupAgentFiles(id: string): string[] {
   const mdPath = join(AGENTS_DIR, `${id}.md`);
-  if (!existsSync(mdPath)) return false;
-  rmSync(mdPath);
-  const memPath = memoryPathFor(id);
-  if (existsSync(memPath)) rmSync(memPath);
-  const identityPath = identityPathFor(id);
-  if (existsSync(identityPath)) rmSync(identityPath);
-  return true;
+  const at = new Date().toISOString().replace(/[:.]/g, "-");
+  const files = [
+    [mdPath, "md"],
+    [memoryPathFor(id), "memory.md"],
+    [identityPathFor(id), "identity.md"],
+  ] as const;
+  const present = files.filter(([path]) => existsSync(path));
+  ensureDir(AGENT_BACKUPS_DIR);
+  for (const [path, ext] of present) copyFileSync(path, join(AGENT_BACKUPS_DIR, `${id}.deleted-${at}.${ext}`));
+  return present.map(([path]) => path);
+}
+
+export function removeAgentFiles(files: string[]): void {
+  for (const path of files) rmSync(path, { force: true });
 }
 
 // ─── Body history (backup snapshots on every body overwrite) ────────────
@@ -192,17 +238,28 @@ export function listAgentBodyHistory(id: string): AgentBodyHistoryEntry[] {
     .sort((a, b) => b.ts - a.ts);
 }
 
-/** Snapshot the given body text to a timestamped file, pruning to the newest
- *  MAX_BODY_HISTORY. Best-effort — never throws (a failed backup must not block a save). */
-export function backupAgentBody(id: string, bodyText: string): void {
+/** Taken before the write it guards, so a failed write still leaves the old body on disk.
+ *  A failed snapshot is logged and does not block the save. */
+export function snapshotAgentBody(id: string, bodyText: string): string | null {
   try {
     ensureDir(AGENTS_DIR);
-    writeFileAtomic(join(AGENTS_DIR, `${bodyHistoryPrefix(id)}${Date.now()}.md`), bodyText);
-    for (const { filename } of listAgentBodyHistory(id).slice(MAX_BODY_HISTORY)) {
-      try { unlinkSync(join(AGENTS_DIR, filename)); } catch { /* best-effort */ }
+    const path = join(AGENTS_DIR, `${bodyHistoryPrefix(id)}${Date.now()}.md`);
+    writeFileAtomic(path, bodyText);
+    return path;
+  } catch (err) {
+    log.warn("agents.body_snapshot_failed", { id, err: String(err) });
+    return null;
+  }
+}
+
+/** Keeps the newest MAX_BODY_HISTORY; only after a write succeeded, so a refused one evicts nothing. */
+export function pruneAgentBodyHistory(id: string): void {
+  for (const { filename } of listAgentBodyHistory(id).slice(MAX_BODY_HISTORY)) {
+    try {
+      unlinkSync(join(AGENTS_DIR, filename));
+    } catch (err) {
+      log.warn("agents.body_prune_failed", { id, filename, err: String(err) });
     }
-  } catch {
-    // backup failure must never block the save
   }
 }
 

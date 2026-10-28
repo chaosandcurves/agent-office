@@ -37,7 +37,9 @@ export interface SkillUpdate {
 }
 
 export interface ApiAgent {
-  /** Stable slug id (kebab-case). */
+  /** The file it lives in, `~/.claude/agents/<id>.md`: the id every per-agent route takes. */
+  id: string;
+  /** The frontmatter `name` the CLI knows it by; the file id when unset. */
   name: string;
   /** Human-readable name; falls back to the slug if unset. */
   displayName?: string;
@@ -74,6 +76,7 @@ export interface AgentBody {
   room?: string;
   unit?: string;
   panel?: PanelSeat[];
+  addDirs?: string[];
 }
 
 /** Who wrote a prompt. Stored, never inferred: a user may type the same words. */
@@ -121,6 +124,20 @@ export interface PersistedRun {
    *  this simply stops appearing once a call ages out — no separate
    *  client-side expiry check needed. */
   toolCalls?: Array<{ id: string; name: string; input: string; ts: number; doneTs?: number; backgrounded?: boolean }>;
+  /** Sub-agents this turn spawned. Unlike `toolCalls`, runs are never pruned. */
+  subRuns?: SubRun[];
+}
+
+export interface SubRun {
+  id: string;
+  agentId: string;
+  prompt: string;
+  status: SubAgentStatus;
+  ts: number;
+  durMs: number;
+  tokensIn: number;
+  tokensOut: number;
+  cost: number;
 }
 
 // ─── Server-authoritative chat conversations (see docs/chat-refactor.md) ─────
@@ -172,7 +189,7 @@ export interface AgentInstance {
   effort?: string;
   permissionMode?: string;
   room?: string;
-  /** Undefined/true = Playwright MCP loaded; false = excluded from the spawn. */
+  /** Opt-in: only true loads the Playwright MCP; otherwise the spawn excludes it (`execution/summon.ts`). */
   playwrightEnabled?: boolean;
   /** True = a turn that edits files is followed by a review loop (`execution/qa-loop.ts`). */
   qaLoopEnabled?: boolean;
@@ -379,7 +396,7 @@ export interface Project {
 /**
  * Only PRESENT keys apply; `null` clears. `accountId: x ?? undefined` broke
  * exactly this by making the key present-but-undefined. No `roster`: those
- * changes go per-instance, or through `replaceRoster` for import.
+ * changes go per-instance, or through `addToRoster` for import.
  */
 export interface ProjectMetaPatch {
   name?: string;
@@ -507,6 +524,8 @@ export interface SseSubAgentEvent {
   agentId: string;
   prompt: string;
   status: SubAgentStatus;
+  /** Replayed on reconnect, when the client's clock is no longer the start. */
+  startTs: number;
 }
 
 export interface SseSubAgentUpdateEvent {
@@ -518,6 +537,7 @@ export interface SseSubAgentUpdateEvent {
   tokensOut: number;
   cost: number;
   lastOutputLine?: string;
+  durationMs?: number;
 }
 
 export type RunStreamEvent =

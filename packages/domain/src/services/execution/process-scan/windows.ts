@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { commandOutput, splitHostPort, type Listener, type ProcDetails } from "./probe";
+import { commandOutput, splitHostPort, type ChildProc, type Listener, type ProcDetails } from "./probe";
 
 // Windows exposes no other process's cwd through WMI, only through its PEB:
 // PEB+0x20 → RTL_USER_PROCESS_PARAMETERS, +0x38 → CurrentDirectory (x64/ARM64
@@ -122,4 +122,42 @@ export async function details(pids: number[]): Promise<Map<number, ProcDetails> 
   const powershell = system32("WindowsPowerShell", "v1.0", "powershell.exe");
   const encoded = Buffer.from(detailsScript(safe), "utf16le").toString("base64");
   return parseDetails((await commandOutput(powershell, ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], POWERSHELL_TIMEOUT_MS)) ?? "");
+}
+
+/** The children script's JSON, `{procs: [{pid, startedAt}]}`; null when PowerShell didn't produce it. */
+export function parseChildren(raw: string): ChildProc[] | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  const procs = asRecord(parsed)?.procs;
+  if (!Array.isArray(procs)) return null;
+  return procs.map(asRecord)
+    .filter((r): r is Record<string, unknown> => r !== null && num(r.pid) > 0)
+    .map((r) => ({ pid: num(r.pid), startedAt: num(r.startedAt) }));
+}
+
+export async function children(pid: number): Promise<ChildProc[] | null> {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return [];
+  // 'Stop': a failed query prints nothing, so it can't read as "no children".
+  // A cmd.exe is cross-spawn's shim for an npm `claude.cmd`: the CLI is its child, and the CLI's
+  // children are the ones asked for, so the search starts one level down.
+  const script = `$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$parents = @(${pid})
+$self = Get-CimInstance Win32_Process -Filter "ProcessId=${pid}"
+if ($self -and $self.Name -ieq 'cmd.exe') {
+  $parents = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=${pid}" | ForEach-Object { [int]$_.ProcessId })
+}
+$procs = @(if ($parents.Count -gt 0) {
+  Get-CimInstance Win32_Process -Filter (($parents | ForEach-Object { "ParentProcessId=$_" }) -join ' OR ') | ForEach-Object {
+    [pscustomobject]@{ pid = [int]$_.ProcessId; startedAt = ([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds() }
+  }
+})
+ConvertTo-Json -Compress -Depth 3 @{ procs = $procs }`;
+  const powershell = system32("WindowsPowerShell", "v1.0", "powershell.exe");
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  return parseChildren((await commandOutput(powershell, ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], POWERSHELL_TIMEOUT_MS)) ?? "");
 }

@@ -82,28 +82,21 @@ const API: DocsExport["api"] = [
   {
     method: "PUT",
     path: "/api/agents/[id]",
-    description: "Update agent definition (backs up body first)",
-    request_type: "agentBodySchema",
+    description: "Update an existing agent (404 if missing): only the keys sent change; a changed body is snapshotted",
+    request_type: "agentUpdateSchema (partial)",
     response_type: "{ id: string }",
   },
   {
     method: "DELETE",
     path: "/api/agents/[id]",
-    description: "Delete agent file and memory sidecar",
-    response_type: "{ deleted: boolean }",
+    description: "Delete agent file, memory and identity sidecars (backed up first)",
+    response_type: "{ deleted: string }",
   },
   {
     method: "GET",
     path: "/api/agents/[id]/body",
     description: "Raw markdown body (no frontmatter)",
     response_type: "text/plain",
-  },
-  {
-    method: "PUT",
-    path: "/api/agents/[id]/body",
-    description: "Replace body; backs up to <id>.body.<ISO>.md",
-    request_type: "text/plain",
-    response_type: "204",
   },
   {
     method: "GET",
@@ -328,7 +321,7 @@ const API: DocsExport["api"] = [
   {
     method: "POST",
     path: "/api/projects/[id]/open-folder",
-    description: "Open project directory with xdg-open",
+    description: "Open the project directory in the OS file manager, or in VS Code with ?app=code",
     response_type: "{ ok: boolean }",
   },
   {

@@ -1,22 +1,64 @@
 // Centralised on-disk paths. Keep these identical to the legacy server's
 // values so existing user data still loads.
 
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync, realpathSync } from "node:fs";
 import { homedir, platform, userInfo } from "node:os";
-import { delimiter, dirname, join, resolve } from "node:path";
+import { basename, delimiter, dirname, join, posix, sep, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { absoluteSearchPath } from "./search-path";
 
 export const HOME = homedir();
 
+type PathApi = typeof posix;
+const nativePath: PathApi = sep === "\\" ? win32 : posix;
+
+/**
+ * The one spelling of a path that every comparison uses. Symlinks are resolved: git prints a
+ * worktree's real path (`C:/x` for `C:\x`, macOS `/var` as `/private/var`, Windows 8.3 short
+ * names expanded), and a delete guard must judge where a path really leads, not how it is spelled.
+ * A path that does not exist resolves through its deepest existing ancestor, so a missing child
+ * still sits inside its resolved parent. Windows compares case-insensitively. `pathApi` is a
+ * parameter so tests can pin `path.win32`; only the native one reads the disk.
+ * `"lexical"` skips the disk, for a bound that only limits what is READ: a Documents folder
+ * moved to another drive by a junction is still the user's Documents.
+ */
+export function pathKey(p: string, pathApi: PathApi = nativePath, links: Links = "follow"): string {
+  const abs = pathApi.resolve(p);
+  const real = pathApi === nativePath && links === "follow" ? realpathOfDeepest(abs) : abs;
+  return pathApi.sep === "\\" ? real.toLowerCase() : real;
+}
+
+function realpathOfDeepest(abs: string): string {
+  const missing: string[] = [];
+  for (let cur = abs; ; ) {
+    try {
+      return join(realpathSync.native(cur), ...missing.reverse());
+    } catch {
+      const parent = dirname(cur);
+      if (parent === cur) return abs;
+      missing.push(basename(cur));
+      cur = parent;
+    }
+  }
+}
+
+type Links = "follow" | "lexical";
+
+export function samePath(a: string, b: string, pathApi: PathApi = nativePath, links: Links = "follow"): boolean {
+  return pathKey(a, pathApi, links) === pathKey(b, pathApi, links);
+}
+
+/** `child` is strictly below `parent`. Never `startsWith(parent + "/")`: that refused every
+ *  Windows path and every mixed-separator one, so guarded deletes silently did nothing. */
+export function isInside(child: string, parent: string, pathApi: PathApi = nativePath, links: Links = "follow"): boolean {
+  const rel = pathApi.relative(pathKey(parent, pathApi, links), pathKey(child, pathApi, links));
+  return rel !== "" && rel !== ".." && !rel.startsWith(".." + pathApi.sep) && !pathApi.isAbsolute(rel);
+}
+
 // A test that resolves the real profile can delete real user data (it did, on
 // Windows, where HOME is ignored and USERPROFILE wins). Fail before any path is used.
 // userInfo() reads the OS account, so env overrides cannot fool it. NODE_TEST_CONTEXT
 // is unset when a test file is run directly (`tsx x.test.ts`), hence the argv check.
-function samePath(a: string, b: string): boolean {
-  const norm = (p: string) => (platform() === "win32" ? resolve(p).toLowerCase() : resolve(p));
-  return norm(a) === norm(b);
-}
 function realAccountHome(): string | null {
   try {
     return userInfo().homedir;
@@ -70,6 +112,10 @@ export const APP_STATE_DIR = join(CLAUDE_DIR, "agent-office");
 export const DB_PATH = join(APP_STATE_DIR, "db.sqlite");
 /** Data a migration removes is written here first. */
 export const BACKUPS_DIR = join(APP_STATE_DIR, "backups");
+/** Never under AGENTS_DIR: the CLI loads every .md beneath it, a backup included, as an agent (C1). */
+export const AGENT_BACKUPS_DIR = join(BACKUPS_DIR, "agents");
+/** A project's state as it was before a save file was imported over it. */
+export const IMPORT_BACKUPS_DIR = join(BACKUPS_DIR, "imports");
 /** Per-run files handed to the CLI by path: appended system prompts and `--settings` pins. */
 export const TMP_PROMPTS_DIR = join(APP_STATE_DIR, "tmp-prompts");
 export const DOCS_DIR = join(APP_STATE_DIR, "docs");
@@ -150,8 +196,10 @@ export function isValidIdSegment(name: string): boolean {
   return /^[A-Za-z0-9._-]+$/.test(name);
 }
 
-export function expandTilde(p: string): string {
-  return p.replace(/^~(?=\/|$)/, HOME);
+/** `~`, `~/x` and, on Windows, `~\x`; the result uses the platform's separators throughout. */
+export function expandTilde(p: string, home: string = HOME, pathApi: PathApi = nativePath): string {
+  const tilde = pathApi.sep === "\\" ? /^~(?=[\\/]|$)/ : /^~(?=\/|$)/;
+  return tilde.test(p) ? pathApi.join(home, p.slice(1)) : p;
 }
 
 /**
