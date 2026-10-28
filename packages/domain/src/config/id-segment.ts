@@ -3,10 +3,11 @@
 // path segment is. They did not — `skillInstallSchema` spelled the charset out
 // as `/^[A-Za-z0-9._-]+$/`, which accepts `..`, and `installSkill` trusted it.
 
-/** Charset only. `..` and a leading `.` match this — use isValidIdSegment. */
-export const ID_SEGMENT_CHARS = /^[A-Za-z0-9._-]+$/;
+// Charset only: `..` and a leading `.` match it. Deliberately NOT exported —
+// a copy of exactly this regex, used as if it were the validator, is the bug.
+const ID_SEGMENT_CHARS = /^[A-Za-z0-9._-]+$/;
 
-export const ID_SEGMENT_MAX = 128;
+const ID_SEGMENT_MAX = 128;
 
 /**
  * Strict validator for URL `:id` / `:name` segments that flow into `path.join`.

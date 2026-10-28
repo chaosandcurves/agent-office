@@ -23,7 +23,7 @@ WEB_DIR="$REPO_ROOT/apps/web"
 ARCH_DIR="$REPO_ROOT/packaging/arch"
 DEB_DIR="$WEB_DIR/src-tauri/target/release/bundle/deb"
 
-for cmd in makepkg pacman node pnpm; do
+for cmd in makepkg pacman sudo node pnpm; do
   command -v "$cmd" >/dev/null || { echo "==> ERROR: $cmd not found — this script is for Arch." >&2; exit 1; }
 done
 
@@ -42,6 +42,9 @@ if [[ -z "$DEB" ]]; then
   exit 1
 fi
 echo "==> Built: $DEB"
+# The PKGBUILD re-globs the newest .deb rather than taking this path, so the
+# check above is "a fresh one exists", not "that exact file gets packaged".
+# Same dir, same sort, one build in flight — but keep them in step if that changes.
 
 echo "==> Repacking into a pacman package..."
 rm -rf "$ARCH_DIR/src" "$ARCH_DIR/pkg"

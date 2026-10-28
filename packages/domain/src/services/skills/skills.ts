@@ -9,11 +9,12 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 import type {
   RegistrySkill,
@@ -39,7 +40,7 @@ export type {
   SkillIconMap,
 } from "../../types/index";
 import { ensureDir, writeFileAtomic } from "../infra/fs-atomic";
-import { SKILLS_DIR, isValidIdSegment } from "../infra/paths";
+import { SKILLS_DIR, isInside, isValidIdSegment } from "../infra/paths";
 import { log } from "../infra/log";
 import { EXTERNAL_API } from "../../config/routes";
 import { isYamlMapping, parseFrontmatter, parseYaml, stringifyYaml, type YamlMapping } from "../infra/yaml";
@@ -343,10 +344,15 @@ async function refreshRegistry(prev: CachedRegistry | null): Promise<RegistrySki
         const dirPath = blob.path.slice(0, -"/SKILL.md".length);
         const rawName = dirPath.split("/").pop() ?? dirPath;
         let description = descBySha.get(blob.sha) ?? "";
+        // The skill's declared tags, when we fetched the file anyway — beats
+        // deriveTags guessing them from the description.
+        let fileTags: string[] = [];
         if (!description) {
           try {
             const content = await fetchSkillMd(src.source, src.ref, blob.path);
-            description = parseSkillMd(content).description;
+            const parsed = parseSkillMd(content);
+            description = parsed.description;
+            fileTags = parsed.tags;
           } catch (e) {
             log.warn("registry.fetch_skill_failed", { path: blob.path, err: String(e) });
           }
@@ -356,6 +362,7 @@ async function refreshRegistry(prev: CachedRegistry | null): Promise<RegistrySki
           ref: src.ref,
           rawName,
           description,
+          fileTags,
           path: dirPath,
           sha: blob.sha,
           size: blob.size,
@@ -372,7 +379,7 @@ async function refreshRegistry(prev: CachedRegistry | null): Promise<RegistrySki
           path: r.path,
           sha: r.sha,
           size: r.size,
-          tags: deriveTags(r.source, r.rawName, r.description, r.path),
+          tags: r.fileTags.length ? r.fileTags : deriveTags(r.source, r.rawName, r.description, r.path),
           installed: isInstalled(name),
         });
       }
@@ -412,8 +419,9 @@ export async function installSkill(
   path: string,
   name: string,
 ): Promise<{ filesWritten: number }> {
-  // `dest` is rmSync'd below, so `..` aimed that at AGENTS_DIR. The only entry
-  // into SKILLS_DIR that trusted its caller; the others already validate.
+  // `dest` is rmSync'd below, so `..` aimed that at AGENTS_DIR. The other
+  // SKILLS_DIR entries are route-guarded by validateIdParam; this one also runs
+  // from updateSkill. Guards `name` only — the write loop checks its own path.
   if (!isValidIdSegment(name)) throw new Error(`invalid skill name: "${name}"`);
 
   ensureSkillsDir();
@@ -434,7 +442,13 @@ export async function installSkill(
   try {
     for (const file of files) {
       const rel = file.path.slice(prefix.length);
-      const localPath = join(staging, rel);
+      // `startsWith(prefix)` does not stop `skills/x/../../../evil`. Only git's
+      // fsck rejecting `..` in a tree path kept this from being exploitable.
+      const localPath = resolve(staging, rel);
+      if (localPath !== staging && !localPath.startsWith(staging + sep)) {
+        log.warn("install.path_escape", { name, path: file.path });
+        continue;
+      }
       mkdirSync(dirname(localPath), { recursive: true });
       const rawUrl = EXTERNAL_API.github.rawFile(source, ref, file.path);
       const fileRes = await fetch(rawUrl);
@@ -514,7 +528,15 @@ function assembleSkillMd(input: WriteSkillInput, carry: YamlMapping = {}): strin
   const fm: YamlMapping = { name: input.name };
   if (input.description) fm.description = input.description;
   if (input.tags?.length) fm.tags = input.tags;
-  const front = stringifyYaml({ ...fm, ...extra }).trimEnd();
+  // The parser has no depth cap but stringifyYaml throws past 36, so a nested
+  // key could parse in and then make the skill permanently unsaveable.
+  let front: string;
+  try {
+    front = stringifyYaml({ ...fm, ...extra }).trimEnd();
+  } catch (e) {
+    log.warn("skill.carry_unserialisable", { name: input.name, err: String(e) });
+    front = stringifyYaml(fm).trimEnd();
+  }
   return `---\n${front}\n---\n\n${stripFrontmatter(input.body)}\n`;
 }
 
@@ -523,6 +545,16 @@ function assembleSkillMd(input: WriteSkillInput, carry: YamlMapping = {}): strin
 function readSkillFrontmatter(name: string): YamlMapping {
   const target = join(SKILLS_DIR, name, "SKILL.md");
   if (!existsSync(target)) return {};
+  try {
+    // writeFileAtomic renames over a symlink rather than following it; this
+    // read would follow, so it is the one call that needs bounding.
+    if (!isInside(realpathSync(target), realpathSync(SKILLS_DIR))) {
+      log.warn("skill.frontmatter_outside_skills_dir", { name });
+      return {};
+    }
+  } catch {
+    return {};
+  }
   try {
     return parseFrontmatter(readFileSync(target, "utf8").replace(/\r\n/g, "\n")).fm;
   } catch {

@@ -15,6 +15,25 @@ import { join } from "node:path";
 import { AGENTS_DIR, SKILLS_DIR } from "../infra/paths";
 import { importPastedSkill, installSkill, readInstalledSkill, writeLocalSkill } from "./skills";
 
+/** Swaps global fetch for the duration, recording every URL it was asked for. */
+async function withFetch(
+  run: (calls: string[]) => Promise<void>,
+  reply: (url: string) => Response = () => new Response("", { status: 404 }),
+): Promise<void> {
+  const real = globalThis.fetch;
+  const calls: string[] = [];
+  globalThis.fetch = ((input: RequestInfo | URL) => {
+    const url = typeof input === "string" ? input : input.toString();
+    calls.push(url);
+    return Promise.resolve(reply(url));
+  }) as typeof fetch;
+  try {
+    await run(calls);
+  } finally {
+    globalThis.fetch = real;
+  }
+}
+
 function freshSkill(name: string, content: string): string {
   const dir = join(SKILLS_DIR, name);
   rmSync(dir, { recursive: true, force: true });
@@ -41,11 +60,36 @@ test("installSkill refuses a traversing name before it can delete anything", asy
 });
 
 test("installSkill rejects before any network call", async () => {
-  // A name check after fetchTree would still be a live SSRF-ish round trip on
-  // every hostile request; assert it throws synchronously-fast, not after I/O.
-  const before = Date.now();
-  await assert.rejects(() => installSkill("owner/repo", "main", "p", ".."), /invalid skill name/);
-  assert.ok(Date.now() - before < 1000, "must fail on validation, not after a GitHub fetch");
+  // Wall-clock cannot tell "guard ran first" from "GitHub 404'd quickly", and a
+  // regression would make the unit suite talk to github.com. Count instead.
+  await withFetch(async (calls) => {
+    await assert.rejects(() => installSkill("owner/repo", "main", "p", ".."), /invalid skill name/);
+    assert.equal(calls.length, 0, "the guard must precede fetchTree");
+  });
+});
+
+test("a tree entry that climbs out of staging is refused, not written", async () => {
+  // git fsck rejects `..` in a tree path, so this cannot be pushed to GitHub
+  // today — the guard exists because that is upstream's invariant, not ours.
+  const escape = join(AGENTS_DIR, "pwned.md");
+  rmSync(escape, { force: true });
+  const prefix = "skills/x";
+  const tree = [
+    { path: `${prefix}/SKILL.md`, type: "blob", sha: "a" },
+    { path: `${prefix}/../../../../../../.claude/agents/pwned.md`, type: "blob", sha: "b" },
+  ];
+
+  await withFetch(
+    async () => {
+      await installSkill("owner/repo", "main", prefix, "escape-test");
+      assert.equal(existsSync(escape), false, "a remote tree entry escaped the staging dir");
+      assert.equal(existsSync(join(SKILLS_DIR, "escape-test", "SKILL.md")), true, "the legitimate file still installs");
+    },
+    (url) =>
+      url.includes("git/trees")
+        ? new Response(JSON.stringify({ tree }), { status: 200 })
+        : new Response("body", { status: 200 }),
+  );
 });
 
 test("editing a skill keeps frontmatter keys the editor does not model", () => {
@@ -110,6 +154,25 @@ test("an installed skill reports the tags in its own file", () => {
     { overwrite: true },
   );
   assert.deepEqual(readInstalledSkill("tags-test")?.tags, ["alpha", "beta"], "tags did not survive a round trip");
+});
+
+test("forking a skill carries none of the source's frontmatter", () => {
+  // The carry reads the DESTINATION name, and a fork writes a name with no file
+  // yet — so an upstream key cannot ride across into a skill whose provenance
+  // writeLocalSkill deliberately drops. Pinned because MANAGED_FM is a 3-key
+  // denylist: if the carry ever keyed off the source, that denylist would be
+  // the only thing between an upstream `allowed-tools` and a "locally owned" skill.
+  freshSkill(
+    "fork-src",
+    ["---", "name: fork-src", "description: upstream", "allowed-tools: Read, Bash", "---", "", "body"].join("\n"),
+  );
+  rmSync(join(SKILLS_DIR, "fork-src-fork"), { recursive: true, force: true });
+
+  writeLocalSkill({ name: "fork-src-fork", description: "mine", body: "body" }, { overwrite: false });
+
+  const forked = readFileSync(join(SKILLS_DIR, "fork-src-fork", "SKILL.md"), "utf8");
+  assert.doesNotMatch(forked, /allowed-tools/, "a fork must not inherit the source's frontmatter");
+  assert.match(readFileSync(join(SKILLS_DIR, "fork-src", "SKILL.md"), "utf8"), /allowed-tools/, "the source is untouched");
 });
 
 test("a forged skill with no file on disk carries nothing and still writes", () => {
