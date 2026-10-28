@@ -96,6 +96,22 @@ test("a managed field is never shadowed by the carried copy", () => {
   assert.match(md, /tags: \[new\]/);
 });
 
+test("an installed skill reports the tags in its own file", () => {
+  // The editor writes `tags` back from what it was handed, so if the read path
+  // cannot see the file's list, every edit replaces it with the registry guess.
+  freshSkill(
+    "tags-test",
+    ["---", "name: tags-test", "description: d", "tags:", "  - alpha", "  - beta", "---", "", "body"].join("\n"),
+  );
+  assert.deepEqual(readInstalledSkill("tags-test")?.tags, ["alpha", "beta"]);
+
+  writeLocalSkill(
+    { name: "tags-test", description: "d", tags: readInstalledSkill("tags-test")?.tags, body: "body" },
+    { overwrite: true },
+  );
+  assert.deepEqual(readInstalledSkill("tags-test")?.tags, ["alpha", "beta"], "tags did not survive a round trip");
+});
+
 test("a forged skill with no file on disk carries nothing and still writes", () => {
   rmSync(join(SKILLS_DIR, "forged-test"), { recursive: true, force: true });
   const saved = writeLocalSkill({ name: "forged-test", description: "d", body: "b" });

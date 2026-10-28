@@ -257,11 +257,15 @@ async function fetchSkillMd(source: string, ref: string, path: string): Promise<
 }
 
 /** Pull description + trimmed body out of a SKILL.md document. */
-function parseSkillMd(content: string): { description: string; body: string } {
+function parseSkillMd(content: string): { description: string; body: string; tags: string[] } {
   const { fm, body } = parseFrontmatter(content);
   return {
     description: typeof fm.description === "string" ? fm.description : "",
     body: body.trim(),
+    // The editor owns `tags` on save, so it has to be able to read the ones
+    // already there — otherwise every edit replaces them with the registry's
+    // guess. Registry entries keep their heuristic tags; these are the file's.
+    tags: Array.isArray(fm.tags) ? fm.tags.filter((t): t is string => typeof t === "string") : [],
   };
 }
 
@@ -590,11 +594,12 @@ export function listInstalled(): InstalledSkill[] {
     if (dir.startsWith("_")) continue;
     const skillMdPath = join(SKILLS_DIR, dir, "SKILL.md");
     if (!existsSync(skillMdPath)) continue;
-    const { description, body } = parseSkillMd(readFileSync(skillMdPath, "utf8").replace(/\r\n/g, "\n"));
+    const { description, body, tags } = parseSkillMd(readFileSync(skillMdPath, "utf8").replace(/\r\n/g, "\n"));
     out.push({
       name: dir,
       description,
       body,
+      tags,
       provenance: readProvenance(dir) ?? undefined,
     });
   }
@@ -604,11 +609,12 @@ export function listInstalled(): InstalledSkill[] {
 export function readInstalledSkill(name: string): InstalledSkill | null {
   const skillMdPath = join(SKILLS_DIR, name, "SKILL.md");
   if (!existsSync(skillMdPath)) return null;
-  const { description, body } = parseSkillMd(readFileSync(skillMdPath, "utf8").replace(/\r\n/g, "\n"));
+  const { description, body, tags } = parseSkillMd(readFileSync(skillMdPath, "utf8").replace(/\r\n/g, "\n"));
   return {
     name,
     description,
     body,
+    tags,
     provenance: readProvenance(name) ?? undefined,
   };
 }

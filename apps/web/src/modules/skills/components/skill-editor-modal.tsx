@@ -85,7 +85,9 @@ export function SkillEditorModal({ open, mode, skill, forceFork, onClose }: Skil
       const real = installedQ.data?.find((s) => s.name === skill.name);
       setName(isFork ? `${skill.name}-fork` : skill.name);
       setDescription(real?.description ?? skill.description);
-      setTags(skill.tags);
+      // The file's own tags, not the registry's inferred ones — saving writes
+      // this list back, so seeding it from a guess silently rewrote them.
+      setTags(real?.tags ?? skill.tags);
       setBody(real?.body ?? STARTER_BODY.replace("my-skill", skill.name));
       setIcon({ seed: `${skill.source}/${skill.name}`, iconClass: "any" });
     } else {
