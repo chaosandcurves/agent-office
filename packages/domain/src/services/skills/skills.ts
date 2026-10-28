@@ -42,7 +42,7 @@ import { ensureDir, writeFileAtomic } from "../infra/fs-atomic";
 import { SKILLS_DIR, isValidIdSegment } from "../infra/paths";
 import { log } from "../infra/log";
 import { EXTERNAL_API } from "../../config/routes";
-import { parseFrontmatter, parseYaml, stringifyYaml, type YamlValue } from "../infra/yaml";
+import { isYamlMapping, parseFrontmatter, parseYaml, stringifyYaml, type YamlMapping } from "../infra/yaml";
 import type { SkillIconClass } from "../../config/skill-icons";
 
 const REGISTRY_CACHE = join(SKILLS_DIR, "_registry.json");
@@ -408,6 +408,10 @@ export async function installSkill(
   path: string,
   name: string,
 ): Promise<{ filesWritten: number }> {
+  // `dest` is rmSync'd below, so `..` aimed that at AGENTS_DIR. The only entry
+  // into SKILLS_DIR that trusted its caller; the others already validate.
+  if (!isValidIdSegment(name)) throw new Error(`invalid skill name: "${name}"`);
+
   ensureSkillsDir();
 
   const tree = await fetchTree(source, ref);
@@ -495,13 +499,31 @@ function stripFrontmatter(content: string): string {
   return (m ? m[1]! : normalized).trim();
 }
 
-/** Assemble a canonical SKILL.md from structured fields + body. */
-function assembleSkillMd(input: WriteSkillInput): string {
-  const fm: Record<string, YamlValue> = { name: input.name };
+/** `WriteSkillInput` owns these; carried-over keys cannot shadow them. */
+const MANAGED_FM = ["name", "description", "tags"] as const;
+
+/** `carry` holds frontmatter the editor doesn't model (`license`, …); rebuilding
+ *  from the managed fields alone silently deleted it on every save. */
+function assembleSkillMd(input: WriteSkillInput, carry: YamlMapping = {}): string {
+  const extra = { ...carry };
+  for (const k of MANAGED_FM) delete extra[k];
+  const fm: YamlMapping = { name: input.name };
   if (input.description) fm.description = input.description;
   if (input.tags?.length) fm.tags = input.tags;
-  const front = stringifyYaml(fm).trimEnd();
+  const front = stringifyYaml({ ...fm, ...extra }).trimEnd();
   return `---\n${front}\n---\n\n${stripFrontmatter(input.body)}\n`;
+}
+
+/** Frontmatter of the skill we're about to overwrite. Absent or unreadable
+ *  means nothing to carry — never a throw, this is a best-effort round trip. */
+function readSkillFrontmatter(name: string): YamlMapping {
+  const target = join(SKILLS_DIR, name, "SKILL.md");
+  if (!existsSync(target)) return {};
+  try {
+    return parseFrontmatter(readFileSync(target, "utf8").replace(/\r\n/g, "\n")).fm;
+  } catch {
+    return {};
+  }
 }
 
 /**
@@ -511,7 +533,7 @@ function assembleSkillMd(input: WriteSkillInput): string {
  */
 export function writeLocalSkill(
   input: WriteSkillInput,
-  opts: { overwrite?: boolean } = {},
+  opts: { overwrite?: boolean; carryFm?: YamlMapping } = {},
 ): InstalledSkill {
   const name = input.name.trim();
   if (!isValidIdSegment(name)) throw new Error(`invalid skill name: "${name}"`);
@@ -520,7 +542,9 @@ export function writeLocalSkill(
 
   const dest = join(SKILLS_DIR, name);
   ensureDir(dest);
-  writeFileAtomic(join(dest, "SKILL.md"), assembleSkillMd(input));
+  // An import has no file on disk yet; its keys come from the pasted text.
+  const carry = opts.carryFm ?? readSkillFrontmatter(name);
+  writeFileAtomic(join(dest, "SKILL.md"), assembleSkillMd(input, carry));
   // A hand-authored/forked skill is owned locally — drop any stale GitHub
   // provenance so it reads as "mine" and never gets update-clobbered.
   const prov = provenancePath(name);
@@ -539,17 +563,23 @@ export function importPastedSkill(content: string): InstalledSkill {
   if (!fm) {
     throw new Error("pasted content has no frontmatter — expected a `--- name/description ---` block");
   }
-  let meta: { name?: string; description?: string; tags?: string[] } = {};
+  let raw: YamlMapping = {};
   try {
-    meta = parseYaml(fm[1]!) as typeof meta;
+    const parsed = parseYaml(fm[1]!);
+    if (isYamlMapping(parsed)) raw = parsed;
   } catch {
     throw new Error("could not parse the frontmatter YAML");
   }
-  const name = (meta.name ?? "").trim();
+  const name = typeof raw.name === "string" ? raw.name.trim() : "";
   if (!name) throw new Error("frontmatter is missing a `name`");
   return writeLocalSkill(
-    { name, description: meta.description ?? "", tags: meta.tags, body: normalized },
-    { overwrite: false },
+    {
+      name,
+      description: typeof raw.description === "string" ? raw.description : "",
+      tags: Array.isArray(raw.tags) ? raw.tags.filter((t): t is string => typeof t === "string") : [],
+      body: normalized,
+    },
+    { overwrite: false, carryFm: raw },
   );
 }
 
