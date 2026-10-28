@@ -30,8 +30,6 @@ import { tierBody } from "./context-tier";
 import { log } from "../infra/log";
 import { PERMISSION_MODE_OPTS, PERMISSION_MODE_ALIASES } from "../../config/agent-opts";
 
-const NO_RESPONSE_STYLE = new Set(["user-analyst"]);
-
 function lineCount(text: string): number {
   return text ? text.split("\n").length : 0;
 }
@@ -121,11 +119,19 @@ export function listAgents(): ApiAgent[] {
         !f.endsWith(".memory.md") &&
         !f.endsWith(".identity.md") &&
         !f.startsWith("_") &&
-        !f.includes(".body.") &&
-        hasAgentFrontmatter(readFileSync(join(AGENTS_DIR, f), "utf8")),
+        !f.includes(".body."),
     )
-    .map((f) => readAgent(f.replace(/\.md$/, ""))?.info)
-    .filter((a): a is ApiAgent => a !== undefined);
+    .flatMap((f) => {
+      // Deleted or locked between the listing and the read: skipped, not fatal to every caller.
+      try {
+        if (!hasAgentFrontmatter(readFileSync(join(AGENTS_DIR, f), "utf8"))) return [];
+        const agent = readAgent(f.replace(/\.md$/, ""));
+        return agent ? [agent.info] : [];
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") log.warn("agents.list_read_failed", { file: f, err: String(err) });
+        return [];
+      }
+    });
 }
 
 /** A sub-agent's `subagent_type` is the CLI's name for it; unclaimed names (project agents) stay as they are. */
@@ -448,15 +454,12 @@ export function composeAppendedPrompt(
     });
   }
 
-  // The style opens with a claim about the reader; a profiler would report it as evidence.
-  if (!NO_RESPONSE_STYLE.has(agentName)) {
-    segments.push({
-      key: "response-style", name: "Response style",
-      text: "## Response style (how to write every reply to the user)\n\n" + RESPONSE_STYLE, body: RESPONSE_STYLE,
-      sub: `built in · ${lineCount(RESPONSE_STYLE)} lines`,
-      locked: true, phase: "always",
-    });
-  }
+  segments.push({
+    key: "response-style", name: "Response style",
+    text: "## Response style (how to write every reply to the user)\n\n" + RESPONSE_STYLE, body: RESPONSE_STYLE,
+    sub: `built in · ${lineCount(RESPONSE_STYLE)} lines`,
+    locked: true, phase: "always",
+  });
 
   if (global) {
     const t_global = tierBody({ body: global, path: GLOBAL_MEMORY_PATH, label: "Global memory", why: "a machine-wide convention or preference might apply" });
