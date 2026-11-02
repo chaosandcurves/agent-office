@@ -4,6 +4,7 @@ import { PERMISSION_MODE_OPTS } from "@agent-office/domain/config/agent-opts";
 import { GENERATED_IMAGE_SLUG, MAX_IMAGES_PER_JOB } from "@agent-office/domain/config/generated-images";
 import { SESSION_REMOVAL_CODES, WORK_CHOICES } from "@agent-office/domain/config/sessions";
 import { isValidIdSegment } from "@agent-office/domain/config/id-segment";
+import { SCHEDULE_REPEAT_EVERY } from "@agent-office/domain/config/schedules";
 import { providerBaseUrlSchema, providerIdSchema, providerModelsSchema } from "./providers";
 
 export const agentBodySchema = z.object({
@@ -319,7 +320,8 @@ export const createScheduleSchema = z.object({
   summonRequest: summonRequestSchema,
   reason: z.enum(["manual", "rate-limit"]).optional(),
   label: z.string().max(200).optional(),
-});
+  repeat: z.enum(SCHEDULE_REPEAT_EVERY).optional(),
+}).refine((b) => !(b.repeat && b.reason === "rate-limit"), { message: "repeat_with_rate_limit" });
 
 export const reassignScheduleSchema = z.object({
   agentId: z.string().min(1).optional(),

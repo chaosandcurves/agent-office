@@ -9,8 +9,9 @@ import type { UnitSelection } from "@/components/ui/unit-sprite-registry";
 import { agentDisplayName } from "@/lib/agent-display-name";
 import { useOfficeAgents } from "@/modules/office/hooks/use-office-agents";
 import { useReassignSchedule } from "../hooks/use-schedules";
+import { agentItems } from "./agent-items";
 
-export function Field({ label, children }: { label: string; children: ReactNode }) {
+function Field({ label, children }: { label: string; children: ReactNode }) {
   return (
     <label className="flex flex-col gap-[6px] min-w-0">
       <span className="text-[10.5px] font-mono tracking-[0.06em] text-txt-4 uppercase">{label}</span>
@@ -21,7 +22,7 @@ export function Field({ label, children }: { label: string; children: ReactNode 
 
 /** Custom dropdown styled as a form field — replaces the native `<select>`
  * (whose OS popup clashed with the app). */
-export function PickerField({
+function PickerField({
   display,
   placeholder,
   items,
@@ -53,25 +54,8 @@ export function PickerField({
   );
 }
 
-export function agentItems(
-  agents: { id: string; name: string; unitChoice: UnitSelection }[],
-  selectedId: string,
-  onPick: (id: string) => void,
-): DropdownItem[] {
-  return agents.map((a) => ({
-    key: a.id,
-    selected: a.id === selectedId,
-    onSelect: () => onPick(a.id),
-    label: (
-      <span className="flex items-center gap-[9px] min-w-0">
-        <AgentAvatar unit={a.unitChoice} size={20} className="rounded" />
-        <span className="truncate">{agentDisplayName(a)}</span>
-      </span>
-    ),
-  }));
-}
 
-export function agentDisplay(agent: { name: string; unitChoice: UnitSelection } | undefined): ReactNode {
+function agentDisplay(agent: { name: string; unitChoice: UnitSelection } | undefined): ReactNode {
   if (!agent) return null;
   return (
     <>
@@ -88,7 +72,7 @@ export function ScheduleReassignRow({ job, onDone }: { job: ScheduledJob; onDone
   const [instanceId, setInstanceId] = useState(job.summonRequest.instanceId ?? "");
 
   return (
-    <div className="flex items-end gap-2 flex-wrap border-t border-edge pt-[12px]">
+    <div className="flex items-end gap-2 flex-wrap">
       <Field label="Agent">
         <PickerField
           ariaLabel="Choose agent"
@@ -102,7 +86,6 @@ export function ScheduleReassignRow({ job, onDone }: { job: ScheduledJob; onDone
         <TextInput value={instanceId} onChange={(e) => setInstanceId(e.target.value)} placeholder="default" className="w-[140px]" />
       </Field>
       <Button
-        size="sm"
         variant="primary"
         onClick={() => {
           reassign.mutate({ id: job.id, target: { agentId, instanceId: instanceId || undefined } });
@@ -111,7 +94,7 @@ export function ScheduleReassignRow({ job, onDone }: { job: ScheduledJob; onDone
       >
         Save
       </Button>
-      <Button size="sm" variant="ghost" onClick={onDone}>
+      <Button variant="ghost" onClick={onDone}>
         Cancel
       </Button>
     </div>
